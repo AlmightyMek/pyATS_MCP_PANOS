@@ -2,3 +2,5 @@ pyats[full]
 mcp
 pydantic
 python-dotenv
+pan-os-python
+xmltodict

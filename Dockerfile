@@ -45,10 +45,13 @@ RUN echo "==> Installing pyATS and other Python packages..." \
         pydantic \
         python-dotenv \
         fastmcp \
+        pan-os-python \
+        xmltodict \
         pyats[full]==25.2.0
 
 # Copy your application code into the container's working directory
 COPY pyats_mcp_server.py .
+COPY pyats_mcp_panos.py .
 
 # Optional: If you have other files needed by the script (e.g., commands.json), copy them too
 # COPY commands.json .
