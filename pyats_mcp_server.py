@@ -19,6 +19,11 @@ from pathlib import Path
 from functools import partial
 from typing import Dict, Any, Optional, List, Union
 
+import xmltodict
+from xml.etree.ElementTree import Element, tostring as xml_tostring
+
+from panos.firewall import Firewall
+from panos.panorama import Panorama
 from dotenv import load_dotenv
 from pyats.topology import loader
 from genie.libs.parser.utils import get_parser
@@ -69,6 +74,253 @@ def clean_output(output: str) -> str:
     return "".join(ch for ch in output if ch in string.printable)
 
 
+# ---------------------------------------------------------------------------
+# PAN-OS helpers
+# ---------------------------------------------------------------------------
+
+def _is_panos(device) -> bool:
+    """Check if device is a PAN-OS firewall or Panorama."""
+    return getattr(device, "os", "").lower() in ("panos", "panorama")
+
+
+def _panos_xml_to_dict(xml_text: str) -> Dict[str, Any]:
+    """Parse an XML string into a Python dict via xmltodict."""
+    try:
+        return xmltodict.parse(xml_text)
+    except Exception as exc:
+        logger.warning("XML parse failed: %s", exc)
+        return {"_parse_error": str(exc)}
+
+
+def _panos_element_to_str(element) -> str:
+    """Convert an xml.etree Element (or plain string) to a UTF-8 string."""
+    if isinstance(element, str):
+        return element
+    try:
+        return xml_tostring(element, encoding="unicode")
+    except Exception:
+        return str(element)
+
+
+def _panos_get_connection_info(device) -> Dict[str, Any]:
+    """Extract host, protocol, username, password, and api_key from a pyATS Device."""
+    info: Dict[str, Any] = {
+        "host": None, "protocol": "https",
+        "username": None, "password": None, "api_key": None, "conn_name": None,
+    }
+    connections = getattr(device, "connections", {}) or {}
+    conn = None
+    for name in ("mgmt", "api", "cli"):
+        if name in connections:
+            conn = connections[name]
+            info["conn_name"] = name
+            break
+    if conn is None and connections:
+        first_name = next(iter(connections))
+        conn = connections[first_name]
+        info["conn_name"] = first_name
+
+    if conn is not None:
+        info["host"] = getattr(conn, "ip", None) or getattr(conn, "host", None)
+        if isinstance(conn, dict):
+            info["host"] = conn.get("ip") or conn.get("host")
+            info["protocol"] = conn.get("protocol", "https")
+        else:
+            info["protocol"] = getattr(conn, "protocol", "https") or "https"
+
+    creds = getattr(device, "credentials", {})
+    default_cred = creds.get("default") if isinstance(creds, dict) else getattr(creds, "default", None)
+    if default_cred is not None:
+        info["username"] = str(getattr(default_cred, "username", "") or "")
+        pw = getattr(default_cred, "password", None)
+        if pw is not None:
+            info["password"] = str(pw)
+
+    dev_name = getattr(device, "name", "")
+    env_key_specific = os.environ.get(f"PANOS_API_KEY_{dev_name.upper().replace('-', '_')}")
+    env_key_global = os.environ.get("PANOS_API_KEY")
+    info["api_key"] = env_key_specific or env_key_global or None
+    return info
+
+
+def _panos_resolve_panorama_device(device):
+    """If device.custom.managed_by names another device in the testbed, return it."""
+    custom = getattr(device, "custom", None) or {}
+    if isinstance(custom, dict):
+        managed_by = custom.get("managed_by")
+    else:
+        managed_by = getattr(custom, "managed_by", None)
+    if not managed_by:
+        return None
+    testbed = getattr(device, "testbed", None)
+    if testbed is None:
+        return None
+    return getattr(testbed, "devices", {}).get(managed_by)
+
+
+def _get_panos_client(device):
+    """Build a pan-os-python Firewall or Panorama client from a pyATS Device.
+
+    Returns (client, is_panorama, metadata).
+    """
+    meta: Dict[str, Any] = {}
+    custom = getattr(device, "custom", None) or {}
+    if not isinstance(custom, dict):
+        custom = {k: getattr(custom, k, None) for k in ("managed_by", "device_group", "serial", "panorama_host")}
+
+    panorama_dev = _panos_resolve_panorama_device(device)
+    is_panorama_type = getattr(device, "type", "").lower() == "panorama" or getattr(device, "os", "").lower() == "panorama"
+
+    if panorama_dev is not None:
+        conn_info = _panos_get_connection_info(panorama_dev)
+        meta["device_group"] = custom.get("device_group")
+        meta["serial"] = custom.get("serial")
+        is_panorama = True
+    elif is_panorama_type:
+        conn_info = _panos_get_connection_info(device)
+        is_panorama = True
+    else:
+        conn_info = _panos_get_connection_info(device)
+        is_panorama = False
+
+    host = conn_info["host"]
+    if not host:
+        raise RuntimeError(f"No host/IP found for device '{getattr(device, 'name', '?')}'")
+
+    api_key = conn_info["api_key"]
+    username = conn_info["username"]
+    password = conn_info["password"]
+
+    if is_panorama:
+        if api_key:
+            client = Panorama(hostname=host, api_key=api_key)
+        elif username and password:
+            client = Panorama(hostname=host, api_username=username, api_password=password)
+        else:
+            raise RuntimeError("No API key or username/password available for Panorama")
+    else:
+        if api_key:
+            client = Firewall(hostname=host, api_key=api_key)
+        elif username and password:
+            client = Firewall(hostname=host, api_username=username, api_password=password)
+        else:
+            raise RuntimeError("No API key or username/password available for firewall")
+
+    logger.info("Created %s client for host %s", "Panorama" if is_panorama else "Firewall", host)
+    return client, is_panorama, meta
+
+
+def _panos_error_result(device, message: str, exc: Optional[Exception] = None) -> Dict[str, Any]:
+    """Build a normalized error dict for PAN-OS operations."""
+    result: Dict[str, Any] = {
+        "status": "error",
+        "error": message,
+        "device": getattr(device, "name", "unknown"),
+    }
+    if exc is not None:
+        result["trace"] = traceback.format_exception_only(type(exc), exc)[-1].strip()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# PAN-OS public API functions
+# ---------------------------------------------------------------------------
+
+def panos_run_show(device, command: str, timeout_s: int = 60) -> Dict[str, Any]:
+    """Run an operational / show command on a PAN-OS device via the XML API."""
+    dev_name = getattr(device, "name", "unknown")
+    try:
+        client, is_panorama, meta = _get_panos_client(device)
+        logger.info("API run_show on %s: %s", dev_name, command)
+        response = client.op(command, cmd_xml=False)
+        raw_xml = _panos_element_to_str(response)
+        parsed = _panos_xml_to_dict(raw_xml)
+        return {
+            "status": "success",
+            "method": "api",
+            "device": dev_name,
+            "output": parsed,
+            "raw_xml": raw_xml,
+        }
+    except Exception as exc:
+        return _panos_error_result(device, f"API run_show failed: {exc}", exc)
+
+
+def panos_get_running_config(device, timeout_s: int = 120) -> Dict[str, Any]:
+    """Fetch the running configuration from a PAN-OS device via the XML API."""
+    dev_name = getattr(device, "name", "unknown")
+    try:
+        client, is_panorama, meta = _get_panos_client(device)
+        logger.info("API get_running_config on %s", dev_name)
+        cmd = "<show><config><running/></config></show>"
+        response = client.op(cmd, cmd_xml=False)
+        raw_xml = _panos_element_to_str(response)
+        parsed = _panos_xml_to_dict(raw_xml)
+        return {
+            "status": "success",
+            "method": "api",
+            "device": dev_name,
+            "output": parsed,
+            "raw_xml": raw_xml,
+        }
+    except Exception as exc:
+        return _panos_error_result(device, f"API get_running_config failed: {exc}", exc)
+
+
+def panos_apply_config(device, xml_config: str, commit: bool = True, push: bool = False, timeout_s: int = 300) -> Dict[str, Any]:
+    """Load configuration onto a PAN-OS device and optionally commit."""
+    dev_name = getattr(device, "name", "unknown")
+    try:
+        client, is_panorama, meta = _get_panos_client(device)
+        logger.info("API apply_config on %s (commit=%s, push=%s)", dev_name, commit, push)
+
+        client.xapi.set(xpath="/config", element=xml_config)
+        logger.info("Configuration loaded on %s", dev_name)
+        details: Dict[str, Any] = {"config_loaded": True}
+
+        if commit:
+            logger.info("Committing on %s ...", dev_name)
+            client.commit(sync=True, timeout=timeout_s)
+            details["panorama_commit" if is_panorama else "commit"] = "ok"
+
+        if push and is_panorama:
+            device_group = meta.get("device_group")
+            serial = meta.get("serial")
+            logger.info("Pushing config from Panorama to device_group=%s serial=%s", device_group, serial)
+            cmd_parts = ["<commit-all><shared-policy>"]
+            if device_group:
+                cmd_parts.append(f"<device-group><entry name=\"{device_group}\">")
+                if serial:
+                    cmd_parts.append(f"<devices><entry name=\"{serial}\"/></devices>")
+                cmd_parts.append("</entry></device-group>")
+            cmd_parts.append("</shared-policy></commit-all>")
+            client.op("".join(cmd_parts), cmd_xml=False)
+
+            deadline = time.time() + timeout_s
+            push_status = "initiated"
+            while time.time() < deadline:
+                time.sleep(10)
+                try:
+                    resp = client.op("<show><jobs><all/></jobs></show>", cmd_xml=False)
+                    raw = _panos_element_to_str(resp)
+                    if "FIN" in raw:
+                        push_status = "completed"
+                        break
+                except Exception:
+                    pass
+            details["push"] = push_status
+
+        return {
+            "status": "success",
+            "method": "api",
+            "device": dev_name,
+            "message": "commit ok" if commit else "config loaded (no commit)",
+            "details": details,
+        }
+    except Exception as exc:
+        return _panos_error_result(device, f"API apply_config failed: {exc}", exc)
+
+
 def _load_testbed():
     """Cache testbed for TTL"""
     now = time.time()
@@ -108,7 +360,10 @@ def _get_device(device_name: str):
                 _CONN_CACHE[device_name]["last_used"] = time.time()
                 return cached
 
-    if not device.is_connected():
+    # Skip SSH connection for PAN-OS devices (API-only)
+    if _is_panos(device):
+        logger.info(f"PAN-OS device {device_name} — skipping SSH (API-only)")
+    elif not device.is_connected():
         logger.info(f"Connecting to {device_name}...")
         device.connect(
             connection_timeout=120,
@@ -268,6 +523,21 @@ def _execute_show_command(device_name: str, command: str) -> Dict[str, Any]:
     try:
         device = _get_device(device_name)
 
+        # Route PAN-OS devices to API
+        if _is_panos(device):
+            logger.info(f"Routing to PAN-OS API for show command: '{command}' on {device_name}")
+            result = panos_run_show(device, command)
+            if result.get("status") == "success":
+                return {
+                    "status": "completed",
+                    "device": device_name,
+                    "command": command,
+                    "output": result.get("output", {}),
+                    "parsed": True,
+                    "method": "api",
+                }
+            return {"status": "error", "device": device_name, "error": result.get("error", "Unknown API error")}
+
         try:
             logger.info(f"Attempting to parse: '{command}' on {device_name}")
             parsed_output = device.parse(command)
@@ -318,6 +588,21 @@ def _execute_config(device_name: str, config_commands: Union[str, List[Any], Non
     try:
         device = _get_device(device_name)
 
+        # Route PAN-OS devices to API
+        if _is_panos(device):
+            logger.info(f"Routing to PAN-OS API for configuration on {device_name}")
+            xml_config = config_commands if isinstance(config_commands, str) else "\n".join(str(x) for x in (config_commands or []))
+            result = panos_apply_config(device, xml_config, commit=True)
+            if result.get("status") == "success":
+                return {
+                    "status": "success",
+                    "device": device_name,
+                    "message": result.get("message", "Configuration applied successfully."),
+                    "output": result.get("details", {}),
+                    "method": "api",
+                }
+            return {"status": "error", "device": device_name, "error": result.get("error", "Unknown API error")}
+
         config_lines = _normalize_config_lines(config_commands)
         if not config_lines:
             return {"status": "error", "error": "Empty configuration provided (after normalization)."}
@@ -358,6 +643,15 @@ def _execute_learn_config(device_name: str) -> Dict[str, Any]:
     device = None
     try:
         device = _get_device(device_name)
+
+        # Route PAN-OS devices to API
+        if _is_panos(device):
+            logger.info(f"Routing to PAN-OS API for running config on {device_name}")
+            result = panos_get_running_config(device)
+            if result.get("status") == "success":
+                return {"status": "completed", "device": device_name, "output": result.get("output", {}), "method": "api"}
+            return {"status": "error", "device": device_name, "error": result.get("error", "Unknown API error")}
+
         device.enable()
         raw = device.execute("show running-config brief")
         return {
@@ -381,6 +675,15 @@ def _execute_learn_logging(device_name: str) -> Dict[str, Any]:
     device = None
     try:
         device = _get_device(device_name)
+
+        # Route PAN-OS devices to API
+        if _is_panos(device):
+            logger.info(f"Routing to PAN-OS API for logging on {device_name}")
+            result = panos_run_show(device, "show logging")
+            if result.get("status") == "success":
+                return {"status": "completed", "device": device_name, "output": result.get("output", {}), "method": "api"}
+            return {"status": "error", "device": device_name, "error": result.get("error", "Unknown API error")}
+
         device.enable()
         raw = device.execute("show logging")
         return {
@@ -411,7 +714,14 @@ def _execute_ping(device_name: str, command: str) -> Dict[str, Any]:
     device = None
     try:
         device = _get_device(device_name)
-        
+
+        if _is_panos(device):
+            return {
+                "status": "error",
+                "device": device_name,
+                "error": "Ping not supported via this tool for PAN-OS devices. Use pyats_run_show_command with 'ping host <target>' instead.",
+            }
+
         # ✅ FIX: Ensure Privileged Exec Mode for advanced ping options
         try:
             if not getattr(device, "is_connected", lambda: False)():
@@ -633,6 +943,7 @@ async def pyats_list_devices() -> str:
 async def pyats_run_show_command(device_name: str, command: str) -> str:
     """
     Execute a show command on a device and return parsed output (or raw if parsing fails).
+    Supports IOS-XE devices via SSH/CLI and PAN-OS devices via XML API.
     DO NOT use this for 'show logging' or 'show running-config' - use dedicated tools.
     DO NOT include pipes or redirects in commands.
     """
@@ -671,6 +982,39 @@ async def pyats_configure_device(device_name: str, config_commands: Any) -> str:
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error in pyats_configure_device: {e}", exc_info=True)
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def pyats_configure_panos_device(
+    device_name: str,
+    xml_config: str,
+    commit: bool = True,
+    push: bool = False,
+) -> str:
+    """
+    Apply XML configuration to a PAN-OS firewall or Panorama device.
+
+    Args:
+        device_name: Name of the PAN-OS device in the testbed.
+        xml_config: XML configuration snippet to load.
+        commit: Whether to commit the configuration (default: True).
+        push: For Panorama — push to managed devices after commit (default: False).
+
+    Example xml_config:
+        '<network><interface><ethernet><entry name="ethernet1/1"><layer3><ip><entry name="10.1.1.1/24"/></ip></layer3></entry></ethernet></interface></network>'
+    """
+    try:
+        tb = _load_testbed()
+        device = tb.devices.get(device_name)
+        if not device:
+            return json.dumps({"status": "error", "error": f"Device '{device_name}' not found in testbed."}, indent=2)
+        if not _is_panos(device):
+            return json.dumps({"status": "error", "error": f"Device '{device_name}' is not a PAN-OS device. Use pyats_configure_device instead."}, indent=2)
+        result = panos_apply_config(device, xml_config, commit=commit, push=push)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in pyats_configure_panos_device: {e}", exc_info=True)
         return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
 
