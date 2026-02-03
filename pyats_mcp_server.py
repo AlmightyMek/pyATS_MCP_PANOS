@@ -15,6 +15,7 @@ import asyncio
 import tempfile
 import subprocess
 import shutil
+import traceback
 from pathlib import Path
 from functools import partial
 from typing import Dict, Any, Optional, List, Union
@@ -24,6 +25,7 @@ from xml.etree.ElementTree import Element, tostring as xml_tostring
 
 from panos.firewall import Firewall
 from panos.panorama import Panorama
+from panos.device import SystemSettings
 from dotenv import load_dotenv
 from pyats.topology import loader
 from genie.libs.parser.utils import get_parser
@@ -191,22 +193,30 @@ def _get_panos_client(device):
     username = conn_info["username"]
     password = conn_info["password"]
 
+    # Add timeout configuration
+    timeout = int(os.getenv("PANOS_HTTP_TIMEOUT", "30"))  # 30 seconds default
+
     if is_panorama:
         if api_key:
-            client = Panorama(hostname=host, api_key=api_key)
+            client = Panorama(hostname=host, api_key=api_key, timeout=timeout)
         elif username and password:
-            client = Panorama(hostname=host, api_username=username, api_password=password)
+            client = Panorama(hostname=host, api_username=username, api_password=password, timeout=timeout)
         else:
             raise RuntimeError("No API key or username/password available for Panorama")
     else:
         if api_key:
-            client = Firewall(hostname=host, api_key=api_key)
+            client = Firewall(hostname=host, api_key=api_key, timeout=timeout)
         elif username and password:
-            client = Firewall(hostname=host, api_username=username, api_password=password)
+            client = Firewall(hostname=host, api_username=username, api_password=password, timeout=timeout)
         else:
             raise RuntimeError("No API key or username/password available for firewall")
 
-    logger.info("Created %s client for host %s", "Panorama" if is_panorama else "Firewall", host)
+    # Configure HTTP session timeout on the underlying xapi object
+    http_timeout = int(os.getenv("PANOS_HTTP_TIMEOUT", "30"))
+    if hasattr(client, 'xapi') and hasattr(client.xapi, 'timeout'):
+        client.xapi.timeout = http_timeout
+
+    logger.info("Created %s client for host %s (HTTP timeout=%ds)", "Panorama" if is_panorama else "Firewall", host, http_timeout)
     return client, is_panorama, meta
 
 
@@ -757,6 +767,144 @@ def _execute_ping(device_name: str, command: str) -> Dict[str, Any]:
     finally:
         _disconnect_device(device)
 
+
+def _list_panorama_devices(panorama_device_name: str, only_connected: bool = True) -> Dict[str, Any]:
+    """
+    List all firewalls connected to a Panorama device using pan-os-python.
+
+    Args:
+        panorama_device_name: Name of the Panorama device in testbed
+        only_connected: If True, only return connected devices (default: True)
+
+    Returns:
+        Dict with status, device count, and list of device details
+    """
+    try:
+        # Load testbed and get Panorama device
+        tb = _load_testbed()
+        device = tb.devices.get(panorama_device_name)
+
+        if not device:
+            return {
+                "status": "error",
+                "error": f"Device '{panorama_device_name}' not found in testbed."
+            }
+
+        # Verify it's a Panorama device
+        if not _is_panos(device):
+            return {
+                "status": "error",
+                "error": f"Device '{panorama_device_name}' is not a PAN-OS device."
+            }
+
+        is_panorama = getattr(device, "type", "").lower() == "panorama" or \
+                      getattr(device, "os", "").lower() == "panorama"
+
+        if not is_panorama:
+            return {
+                "status": "error",
+                "error": f"Device '{panorama_device_name}' is not a Panorama device. Use a Panorama-type device."
+            }
+
+        # Get Panorama client
+        client, _, _ = _get_panos_client(device)
+
+        # Call refresh_devices to get connected firewalls
+        try:
+            logger.info(f"Querying Panorama {panorama_device_name} for connected devices (this may take 30-60s)...")
+            firewalls = client.refresh_devices(
+                expand_vsys=False,              # Don't create separate objects for each vsys
+                include_device_groups=False,    # Return flat list of Firewall objects
+                only_connected=only_connected,  # Filter by connection status
+                add=False                       # Don't modify Panorama's config tree
+            )
+            logger.info(f"Successfully retrieved {len(firewalls)} firewalls from Panorama")
+        except Exception as refresh_exc:
+            logger.error(f"Failed to refresh devices from Panorama: {refresh_exc}")
+            return {
+                "status": "error",
+                "error": f"Failed to query Panorama: {str(refresh_exc)}. Check network connectivity and credentials."
+            }
+
+        # Extract device information
+        devices_list = []
+        logger.info(f"Processing {len(firewalls)} firewalls from Panorama...")
+
+        for idx, fw in enumerate(firewalls, 1):
+            try:
+                logger.debug(f"Processing firewall {idx}/{len(firewalls)}: serial={getattr(fw, 'serial', 'unknown')}")
+
+                # Get SystemSettings to access hostname and IP
+                system_settings = fw.find("", SystemSettings)
+
+                device_info = {
+                    "serial": getattr(fw, "serial", None),
+                    "hostname": getattr(system_settings, "hostname", None) if system_settings else None,
+                    "ip_address": getattr(system_settings, "ip_address", None) if system_settings else None,
+                    "vsys": getattr(fw, "vsys", "vsys1"),
+                }
+
+                # Add optional fields if available
+                if hasattr(fw, "version"):
+                    device_info["version"] = fw.version
+                elif hasattr(fw, "sw_version"):
+                    device_info["version"] = fw.sw_version
+
+                if hasattr(fw, "ha_peer"):
+                    device_info["ha_peer"] = fw.ha_peer
+
+                if hasattr(fw, "model"):
+                    device_info["model"] = fw.model
+
+                devices_list.append(device_info)
+
+            except Exception as parse_exc:
+                logger.warning(f"Error parsing device {getattr(fw, 'serial', 'unknown')}: {parse_exc}")
+                # Add minimal info even if parsing fails
+                devices_list.append({
+                    "serial": getattr(fw, "serial", None),
+                    "error": f"Failed to parse device details: {str(parse_exc)}"
+                })
+
+        # Return structured response
+        return {
+            "status": "completed",
+            "panorama_device": panorama_device_name,
+            "device_count": len(devices_list),
+            "only_connected": only_connected,
+            "devices": devices_list,
+            "method": "api"
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing Panorama devices: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "error": f"Failed to list devices from Panorama: {str(e)}"
+        }
+
+
+async def list_panorama_devices_async(panorama_device_name: str, only_connected: bool = True) -> Dict[str, Any]:
+    """Async wrapper for listing Panorama connected devices."""
+    loop = asyncio.get_running_loop()
+    timeout = int(os.getenv("PYATS_MCP_PANORAMA_TIMEOUT", "120"))  # Default 120s
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                partial(_list_panorama_devices, panorama_device_name, only_connected)
+            ),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Panorama device listing timed out after {timeout}s")
+        return {
+            "status": "error",
+            "error": f"Operation timed out after {timeout} seconds. Panorama may be slow to respond or unreachable."
+        }
+
+
 async def run_linux_command_async(device_name: str, command: str) -> Dict[str, Any]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(_execute_linux_command, device_name, command))
@@ -1092,6 +1240,51 @@ async def pyats_run_dynamic_test(test_script_content: str) -> str:
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error in pyats_run_dynamic_test: {e}", exc_info=True)
+        return json.dumps({"status": "error", "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def pyats_list_panorama_connected_devices(panorama_device_name: str) -> str:
+    """
+    List all firewalls connected to a Panorama management device.
+
+    This tool queries a Panorama device to retrieve information about all managed
+    firewalls, including their serial numbers, hostnames, IP addresses, software
+    versions, and connection status.
+
+    Args:
+        panorama_device_name: Name of the Panorama device in the testbed (must have
+                            type='panorama' or os='panorama' in testbed.yaml)
+
+    Returns:
+        JSON string containing:
+        - status: "completed" or "error"
+        - panorama_device: Name of the queried Panorama device
+        - device_count: Number of connected firewalls found
+        - devices: List of device information dictionaries with fields:
+            - serial: Device serial number
+            - hostname: Device hostname
+            - ip_address: Management IP address
+            - version: PAN-OS software version (if available)
+            - vsys: Virtual system identifier
+            - model: Hardware/VM model (if available)
+            - ha_peer: HA peer information (if available)
+
+    Example:
+        # List all firewalls connected to Panorama
+        pyats_list_panorama_connected_devices("Panorama")
+
+    Note:
+        - Requires pan-os-python library
+        - Uses API key from PANOS_API_KEY environment variable
+        - Only returns connected devices by default
+        - Does not require SSH access to Panorama
+    """
+    try:
+        result = await list_panorama_devices_async(panorama_device_name, only_connected=True)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error in pyats_list_panorama_connected_devices: {e}", exc_info=True)
         return json.dumps({"status": "error", "error": str(e)}, indent=2)
 
 
