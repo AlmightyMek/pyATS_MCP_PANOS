@@ -8,5 +8,5 @@ devices:
     connections:
       api:
         protocol: https
-        ip: 10.19.0.103
+        ip: 1.1.1.1
         port: 443
